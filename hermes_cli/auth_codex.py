@@ -20,7 +20,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple
 from hermes_cli.auth_constants import (
-    _decode_jwt_claims, AUTH_LOCK_TIMEOUT_SECONDS, AuthError,
+    _decode_jwt_claims, AUTH_REFRESH_POST_TIMEOUT_SECONDS, auth_lock_hold_timeout, AuthError,
     CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS, CODEX_OAUTH_CLIENT_ID, CODEX_OAUTH_TOKEN_URL,
     CODEX_OAUTH_USER_AGENT, CODEX_RATE_LIMITED_CODE, DEFAULT_CODEX_BASE_URL, _codex_err, httpx)
 from utils import env_float
@@ -74,9 +74,9 @@ def _codex_runtime_result(
 
 def _load_auth_store_maybe_locked(lock: bool) -> Dict[str, Any]:
     """Load the auth store, taking the cross-process lock unless the caller already holds it."""
-    from hermes_cli.auth import _auth_store_lock, _load_auth_store
+    from hermes_cli.auth import _auth_store_read_lock, _load_auth_store
     if lock:
-        with _auth_store_lock():
+        with _auth_store_read_lock():
             return _load_auth_store()
     return _load_auth_store()
 
@@ -460,7 +460,7 @@ def resolve_codex_runtime_credentials(
         raise _codex_err(_NO_CREDENTIALS_MSG, "codex_auth_missing", relogin=True)
     tokens = dict(data["tokens"])
     access_token = _stripped(tokens.get("access_token"))
-    refresh_timeout_seconds = env_float("HERMES_CODEX_REFRESH_TIMEOUT_SECONDS", 20)
+    refresh_timeout_seconds = env_float("HERMES_CODEX_REFRESH_TIMEOUT_SECONDS", AUTH_REFRESH_POST_TIMEOUT_SECONDS)
 
     def _should_refresh(token: str) -> bool:
         return bool(force_refresh) or (
@@ -468,7 +468,7 @@ def resolve_codex_runtime_credentials(
 
     if _should_refresh(access_token):
         # Re-read under lock to avoid racing with other Hermes processes
-        lock_timeout = max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)
+        lock_timeout = auth_lock_hold_timeout(refresh_timeout_seconds)
         with _auth_store_lock(timeout_seconds=lock_timeout):
             data = _read_codex_tokens(_lock=False)
             tokens = dict(data["tokens"])
@@ -608,8 +608,8 @@ def _codex_pool_dicts(entries: Optional[List[Any]]) -> Iterator[Dict[str, Any]]:
 
 def _read_codex_pool_entries() -> Optional[List[Any]]:
     """Locked read of ``credential_pool.openai-codex`` from auth.json (None when absent)."""
-    from hermes_cli.auth import _auth_store_lock, _load_auth_store
-    with _auth_store_lock():
+    from hermes_cli.auth import _auth_store_read_lock, _load_auth_store
+    with _auth_store_read_lock():
         auth_store = _load_auth_store()
     return _pool_entries(auth_store, "openai-codex")
 

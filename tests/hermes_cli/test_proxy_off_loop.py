@@ -4,11 +4,13 @@
 method is a plain ``def``), and both shipped adapters implement it with
 blocking I/O:
 
-  * ``NousPortalAdapter.get_credential`` takes ``_auth_store_lock()``, a
-    *cross-process* advisory lock with ``AUTH_LOCK_TIMEOUT_SECONDS = 15.0``
-    (``hermes_cli/auth.py:110``), reads ``auth.json`` from disk, and may issue a
-    token-refresh POST. Its terminal-error path takes that lock a second time to
-    persist the quarantined state.
+  * ``NousPortalAdapter.get_credential`` reads ``auth.json`` from disk under
+    ``_auth_store_read_lock()`` — a *cross-process* advisory lock on the same
+    file as the write budget, but with ``AUTH_LOCK_READ_TIMEOUT_SECONDS``
+    (``hermes_cli/auth_constants.py``) so a slow refresh holder cannot starve it
+    — and may issue a token-refresh POST. Its terminal-error path takes the
+    write-side ``_auth_store_lock()`` (``AUTH_LOCK_TIMEOUT_SECONDS``) to persist
+    the quarantined state.
   * ``NousPortalAdapter.get_retry_credential`` routes to that same
     ``_get_credential`` with ``force_refresh=True``, so the refresh POST it only
     *may* perform above is unconditional here.
@@ -327,8 +329,9 @@ def test_get_retry_credential_runs_off_the_event_loop():
     ``UpstreamAdapter`` contract, and it is the most expensive of them:
     ``NousPortalAdapter`` routes it into ``_get_credential(force_refresh=True)``,
     so the token-refresh POST that ``get_credential`` performs only near expiry
-    is unconditional here, and it happens under the same 15s cross-process
-    ``_auth_store_lock()``. ``XAIGrokAdapter`` loads its key pool off disk and
+    is unconditional here, and it happens under the same cross-process
+    ``_auth_store_lock()`` (``AUTH_LOCK_TIMEOUT_SECONDS``).
+    ``XAIGrokAdapter`` loads its key pool off disk and
     rotates it under ``self._lock``.
 
     Called inline, that whole rotation runs on the loop thread and this
@@ -463,7 +466,7 @@ def test_is_authenticated_runs_off_the_event_loop():
 
     ``adapters/base.py`` documents ``is_authenticated`` as "cheap — no network
     calls", but ``NousPortalAdapter`` implements it via ``_read_state()``, which
-    takes the same 15s cross-process ``_auth_store_lock()``. ``/health`` is what
+    takes the same cross-process ``_auth_store_read_lock()``. ``/health`` is what
     a supervisor, systemd unit, container healthcheck or load balancer polls, so
     it is the endpoint least able to afford a lock wait.
     """

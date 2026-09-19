@@ -16,7 +16,8 @@ from typing import Any, Dict, Optional, TYPE_CHECKING
 from urllib.parse import urlparse
 from hermes_cli.auth_codex import _load_auth_store_maybe_locked, _refresh_payload_access_token
 from hermes_cli.auth_constants import (
-    AUTH_LOCK_TIMEOUT_SECONDS, AuthError, DEFAULT_XAI_OAUTH_BASE_URL, DEVICE_CODE_GRANT_TYPE,
+    AUTH_REFRESH_POST_TIMEOUT_SECONDS, auth_lock_hold_timeout, AuthError, DEFAULT_XAI_OAUTH_BASE_URL,
+    DEVICE_CODE_GRANT_TYPE,
     XAI_ACCESS_TOKEN_REFRESH_SKEW_SECONDS, XAI_OAUTH_CLIENT_ID, XAI_OAUTH_DEVICE_CODE_URL,
     XAI_OAUTH_DISCOVERY_URL, XAI_OAUTH_SCOPE, _FORM_JSON_HEADERS, _xai_err, httpx,
 )
@@ -432,9 +433,9 @@ def resolve_xai_oauth_runtime_credentials(
 
     data = _read_xai_oauth_tokens()
     tokens = dict(data["tokens"])
-    refresh_timeout_seconds = env_float("HERMES_XAI_REFRESH_TIMEOUT_SECONDS", 20)
+    refresh_timeout_seconds = env_float("HERMES_XAI_REFRESH_TIMEOUT_SECONDS", AUTH_REFRESH_POST_TIMEOUT_SECONDS)
     if _should_refresh(data):
-        with _auth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
+        with _auth_store_lock(timeout_seconds=auth_lock_hold_timeout(refresh_timeout_seconds)):
             # Re-read under the lock: a concurrent caller may already have rotated the grant.
             data = _read_xai_oauth_tokens(_lock=False)
             tokens = dict(data["tokens"])

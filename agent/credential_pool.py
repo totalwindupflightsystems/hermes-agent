@@ -30,6 +30,7 @@ from hermes_cli.auth import (
     PROVIDER_REGISTRY,
     SINGLE_USE_REFRESH_POOL_PROVIDERS,
     _auth_store_lock,
+    _auth_store_read_lock,
     _codex_access_token_is_expiring,
     _decode_jwt_claims,
     _global_auth_file_path,
@@ -1232,7 +1233,7 @@ class CredentialPool(CredentialPoolAdminMixin):
         if entry.source not in sources:
             return entry
         try:
-            with _auth_store_lock():
+            with _auth_store_read_lock():
                 state = _load_provider_state(_load_auth_store(), self.provider)
             tokens = state.get("tokens") if isinstance(state, dict) else None
             if not isinstance(tokens, dict):
@@ -1284,7 +1285,7 @@ class CredentialPool(CredentialPoolAdminMixin):
         if self.provider != "nous" or entry.source != "device_code":
             return entry
         try:
-            with _auth_store_lock():
+            with _auth_store_read_lock():
                 state = _load_provider_state(_load_auth_store(), "nous")
             if not state:
                 return entry
@@ -1487,8 +1488,8 @@ class CredentialPool(CredentialPoolAdminMixin):
     def _single_use_refresh_lock_timeout(self) -> float:
         """Configured refresh POST timeout plus margin, so a slow token endpoint cannot starve the flock."""
         env_var = _REFRESH_TIMEOUT_ENV_VARS.get(self.provider, "HERMES_ANTHROPIC_REFRESH_TIMEOUT_SECONDS")
-        refresh_timeout_seconds = auth_mod.env_float(env_var, 20)
-        return max(float(auth_mod.AUTH_LOCK_TIMEOUT_SECONDS), float(refresh_timeout_seconds) + 5.0)
+        refresh_timeout_seconds = auth_mod.env_float(env_var, auth_mod.AUTH_REFRESH_POST_TIMEOUT_SECONDS)
+        return auth_mod.auth_lock_hold_timeout(refresh_timeout_seconds)
 
     def _commit_anthropic_rotation(
         self, entry: PooledCredential, refreshed: Dict[str, Any]

@@ -319,9 +319,11 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
     token instead of racing it into ``invalid_grant``. Read, decision, POST and write-back share the pool's
     path-keyed cross-process lock (else two profiles can spend one refresh token)."""
     try:
-        from hermes_cli.auth import AUTH_LOCK_TIMEOUT_SECONDS, _auth_store_lock, env_float
-        refresh_timeout_seconds = env_float("HERMES_ANTHROPIC_REFRESH_TIMEOUT_SECONDS", 20)
-        lock_timeout_seconds = max(float(AUTH_LOCK_TIMEOUT_SECONDS), float(refresh_timeout_seconds) + 5.0)
+        from hermes_cli.auth import (
+            AUTH_REFRESH_POST_TIMEOUT_SECONDS, _auth_store_lock, auth_lock_hold_timeout, env_float)
+        refresh_timeout_seconds = env_float(
+            "HERMES_ANTHROPIC_REFRESH_TIMEOUT_SECONDS", AUTH_REFRESH_POST_TIMEOUT_SECONDS)
+        lock_timeout_seconds = auth_lock_hold_timeout(refresh_timeout_seconds)
         cred_path = claude_code_credentials_path()
         with _auth_store_lock(timeout_seconds=lock_timeout_seconds, target_path=cred_path):
             # Adopt only a DIFFERENT token with a real future expiry (0/absent expiresAt = managed key/unknown).

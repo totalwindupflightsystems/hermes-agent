@@ -47,7 +47,62 @@ else:
 # ── Constants ───────────────────────────────────────────────────────────────────────────────────────
 
 AUTH_STORE_VERSION = 1
+
+# ── Auth-store lock budget arithmetic ────────────────────────────────────────────────────────────
+#
+# The auth store has ONE cross-process flock every Hermes process serializes on (auth.json.lock).
+# Two kinds of transaction want it, with different budgets:
+#
+#   WRITE — load, mutate, atomically rewrite. Bounded by AUTH_LOCK_TIMEOUT_SECONDS: a stuck writer
+#           must fail loudly rather than queue the whole fleet behind it.
+#   READ  — load only. Must never be failed by a slow HOLDER: a refresh transaction legitimately
+#           keeps the lock across its token-endpoint POST, which takes up to the hold ceiling
+#           below. A reader that gives up mid-POST loses a whole agent tick while the store is
+#           perfectly healthy, and the failure looks like broken credentials.
+#
+# Deriving all four numbers here, and asserting the ordering, is what keeps the reader budget from
+# being shorter than a holder's worst case (GAP-057: a 15s reader vs a 25s refresh holder).
 AUTH_LOCK_TIMEOUT_SECONDS = 15.0
+
+# Default timeout of a token-endpoint POST performed while the auth-store lock is HELD. Each
+# refresh path honours a provider-specific env override but defaults to this value.
+AUTH_REFRESH_POST_TIMEOUT_SECONDS = 20.0
+
+# Spare lock time a holder gets on top of its POST budget: after the POST returns it still has to
+# re-read and atomically rewrite the store before it releases.
+AUTH_LOCK_HOLD_MARGIN_SECONDS = 5.0
+
+
+def auth_lock_hold_timeout(post_timeout_seconds: float = AUTH_REFRESH_POST_TIMEOUT_SECONDS) -> float:
+    """Lock budget for a transaction that holds the auth-store lock across a network POST.
+
+    Single source for the formula every refresh path used to duplicate inline
+    (``max(AUTH_LOCK_TIMEOUT_SECONDS, post_timeout + 5.0)``), so the worst case can be compared
+    against the reader budget instead of being re-derived per call site.
+    """
+    return max(AUTH_LOCK_TIMEOUT_SECONDS, float(post_timeout_seconds) + AUTH_LOCK_HOLD_MARGIN_SECONDS)
+
+
+# Worst case a well-behaved holder may keep the auth-store lock: the default refresh POST plus the
+# write-leg margin.
+AUTH_LOCK_HOLD_CEILING_SECONDS = auth_lock_hold_timeout()
+
+# Spare time a READ transaction waits past the hold ceiling: the holder's write leg (re-read +
+# atomic rewrite of auth.json) still has to land after its POST returns.
+AUTH_LOCK_READ_MARGIN_SECONDS = 5.0
+
+# Budget for a read-only auth-store transaction. A reader must outlast any holder it can collide
+# with, so this is the ceiling plus the writer's write leg.
+AUTH_LOCK_READ_TIMEOUT_SECONDS = AUTH_LOCK_HOLD_CEILING_SECONDS + AUTH_LOCK_READ_MARGIN_SECONDS
+
+if AUTH_LOCK_READ_TIMEOUT_SECONDS < AUTH_LOCK_HOLD_CEILING_SECONDS:  # pragma: no cover - guard
+    # Not an `assert`: this must survive `python -O`, and the failure it prevents is silent — every
+    # read that collides with a refresh holder dies with "Timed out waiting for auth store lock"
+    # and takes a whole agent tick with it, while the store is healthy.
+    raise RuntimeError(
+        "auth-store lock budget inversion: readers get "
+        f"{AUTH_LOCK_READ_TIMEOUT_SECONDS}s but holders may keep the lock "
+        f"{AUTH_LOCK_HOLD_CEILING_SECONDS}s, so a slow refresh starves every read")
 
 # Nous Portal defaults
 DEFAULT_NOUS_PORTAL_URL = "https://portal.nousresearch.com"

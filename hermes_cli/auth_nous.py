@@ -20,7 +20,8 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, FrozenSet, List, Optional
 from urllib.parse import urlparse
 from hermes_cli.auth_codex import _pool_entries
 from hermes_cli.auth_constants import (
-    _decode_jwt_claims, AUTH_LOCK_TIMEOUT_SECONDS, AuthError, DEFAULT_NOUS_CLIENT_ID,
+    _decode_jwt_claims, AUTH_LOCK_TIMEOUT_SECONDS, auth_lock_hold_timeout, AuthError,
+    DEFAULT_NOUS_CLIENT_ID,
     DEFAULT_NOUS_INFERENCE_URL, DEFAULT_NOUS_PORTAL_URL, DEFAULT_NOUS_SCOPE,
     DEVICE_AUTH_POLL_INTERVAL_CAP_SECONDS, NOUS_AUTH_PATH_INVOKE_JWT, NOUS_BILLING_MANAGE_SCOPE,
     NOUS_DEVICE_CODE_SOURCE, NOUS_INFERENCE_INVOKE_SCOPE, NOUS_INVOKE_JWT_MIN_TTL_SECONDS,
@@ -323,7 +324,8 @@ def _nous_shared_store_lock(timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS):
 
 
 def _shared_lock_timeout(timeout_seconds: float) -> float:
-    return max(timeout_seconds + 5.0, AUTH_LOCK_TIMEOUT_SECONDS)
+    """Holder budget for the shared Nous store: the caller's POST budget plus the write leg."""
+    return auth_lock_hold_timeout(timeout_seconds)
 
 
 # OAuth fields mirrored between a profile's Nous state and the shared cross-profile store.

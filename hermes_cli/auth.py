@@ -91,6 +91,8 @@ from hermes_cli.auth_qwen import (  # noqa: F401  re-exported
     resolve_qwen_runtime_credentials)
 from hermes_cli.auth_constants import (  # noqa: F401  re-exported
     _decode_jwt_claims, AUTH_STORE_VERSION, AUTH_LOCK_TIMEOUT_SECONDS, DEFAULT_NOUS_PORTAL_URL,
+    AUTH_REFRESH_POST_TIMEOUT_SECONDS, AUTH_LOCK_HOLD_CEILING_SECONDS,
+    AUTH_LOCK_READ_TIMEOUT_SECONDS, auth_lock_hold_timeout,
     DEFAULT_NOUS_INFERENCE_URL, DEFAULT_NOUS_CLIENT_ID, NOUS_BILLING_MANAGE_SCOPE,
     DEFAULT_NOUS_SCOPE, NOUS_DEVICE_CODE_SOURCE, NOUS_AUTH_PATH_INVOKE_JWT,
     ACCESS_TOKEN_REFRESH_SKEW_SECONDS, NOUS_INVOKE_JWT_MIN_TTL_SECONDS, DEFAULT_CODEX_BASE_URL,
@@ -632,11 +634,35 @@ def _file_lock(
 @contextmanager
 def _auth_store_lock(
     timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS, *, target_path: Optional[Path] = None):
-    """Cross-process advisory lock for one auth.json read/write transaction.
+    """Cross-process advisory lock for one auth.json WRITE (read-modify-write) transaction.
 
     ``target_path`` is required for profile-to-global write-throughs: each path has its own
     reentrancy tracker and kernel lock. Lock ordering invariant: ``_auth_store_lock`` FIRST (outer),
     ``_nous_shared_store_lock`` SECOND (inner), else deadlock against a concurrent shared import."""
+    auth_path = target_path if target_path is not None else _auth_file_path()
+    with _file_lock(
+        auth_path.with_suffix(".lock"), _auth_lock_holder_for(auth_path), timeout_seconds,
+        "Timed out waiting for auth store lock"):
+        yield
+
+
+@contextmanager
+def _auth_store_read_lock(
+    timeout_seconds: float = AUTH_LOCK_READ_TIMEOUT_SECONDS, *, target_path: Optional[Path] = None):
+    """Cross-process advisory lock for one READ-ONLY auth.json transaction.
+
+    Same lock file, same reentrancy tracker and same lock-ordering invariant as
+    :func:`_auth_store_lock` — the store has exactly one serialization point — but a longer budget,
+    because a reader must never be failed by a slow HOLDER: a refresh transaction legitimately keeps
+    this lock across its token-endpoint POST (up to ``AUTH_LOCK_HOLD_CEILING_SECONDS``), and the
+    reader that gives up loses a whole agent tick while the store is healthy (the failure reads as
+    broken credentials).
+
+    Use this ONLY for a lock body that does not mutate the store: a read-modify-write transaction on
+    this budget would pin the fleet's single auth lock that much longer, so writers stay on
+    :func:`_auth_store_lock`. Sharing the reentrancy tracker is load-bearing — a read helper called
+    from inside a write transaction (e.g. the credential pool's in-lock re-sync) must short-circuit
+    on ``depth > 0`` instead of re-flocking a file this thread already holds."""
     auth_path = target_path if target_path is not None else _auth_file_path()
     with _file_lock(
         auth_path.with_suffix(".lock"), _auth_lock_holder_for(auth_path), timeout_seconds,
@@ -1626,7 +1652,7 @@ def resolve_nous_access_token(
         persist = lambda: _save_provider_state_to_source(  # noqa: E731
             auth_store, "nous", state, state_source_path)
 
-        lock_timeout = max(timeout_seconds + 5.0, AUTH_LOCK_TIMEOUT_SECONDS)
+        lock_timeout = auth_lock_hold_timeout(timeout_seconds)
         with _nous_shared_store_lock(timeout_seconds=lock_timeout):
             merged_shared = _merge_shared_nous_oauth_state(state)
             access_token = state.get("access_token")

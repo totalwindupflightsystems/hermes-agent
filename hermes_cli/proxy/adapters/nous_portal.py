@@ -11,6 +11,7 @@ from hermes_cli.auth import (
     DEFAULT_NOUS_INFERENCE_URL,
     _load_auth_store,
     _auth_store_lock,
+    _auth_store_read_lock,
     _is_terminal_nous_refresh_error,
     _nous_inference_env_override,
     _quarantine_nous_oauth_state,
@@ -101,7 +102,7 @@ class NousPortalAdapter(UpstreamAdapter):
 
     def _read_state(self) -> Optional[Dict[str, Any]]:
         try:
-            with _auth_store_lock():
+            with _auth_store_read_lock():
                 store = _load_auth_store()
         except Exception as exc:
             logger.warning("proxy: failed to load auth store: %s", exc)
