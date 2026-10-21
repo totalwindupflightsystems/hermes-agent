@@ -238,6 +238,31 @@ CLI and non-notifying processes, and preserves the producer's profile context in
 reader threads. Receipt redaction is forced independently of live-output opt-out;
 retention is bounded by age and count.
 
+### Termination attribution
+
+A reader thread that sees EOF learns only a returncode, so a process killed by a signal used to
+be recorded as `completion_reason: "exited"` with an empty `termination_source` — identical, to
+every consumer, to one that finished on its own. `tools/process_registry_attribution.py` now
+finalises every completion once, on the single finish path (`_move_to_finished`):
+
+- a negative returncode is classified as a kill (`completion_reason: "killed"`), and
+  `termination_source` names the killer from evidence that outlives the process, in order: the
+  registry's own stop request (recorded **before** any signal is sent, so a kill that races the
+  reader cannot be mis-attributed), the worker cgroup's `oom_kill` counter (`cgroup_oom`), the
+  systemd unit's `Result` (`systemd`). With none of those the token is
+  `unknown_no_supervisor_stop` — never an empty string, and never a guess;
+- `termination_detail` carries the sentence behind the token: the signal, the elapsed time and
+  each surface that was checked with its answer, so a receipt is diagnosable on its own;
+- `termination_accounting` lists every cap the harness could have applied (wall clock, the
+  foreground timeout, the one-shot linger, the worker cgroup's memory limit) **with whether it
+  applied**, which is what makes "there is no ~600s policy" a measurement instead of a claim;
+- `dirty_worktree` reports the git state of the process's cwd when it died abnormally (signal,
+  lost backend, non-zero exit), so salvage needs no manual tree inspection. The same line is
+  appended to the completion notice the model reads.
+
+In the gateway's completion event both fields ride through (`gateway/run_notifications.py`), and
+any signal — not just SIGTERM — is named in the notice's `(exit code N, SIGNAL)` header.
+
 ## Concurrency
 
 Tool calls may execute sequentially or concurrently depending on the tool mix and interaction requirements.

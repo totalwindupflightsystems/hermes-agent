@@ -1645,7 +1645,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         """Last ``limit`` chars of process output through the secret redactors (unconditional floor)."""
         from gateway.run import _redact_gateway_user_facing_secrets
         from tools.ansi_strip import strip_ansi
-        from tools.process_registry import transform_process_output
+        from tools.process_registry_output_transform import transform_process_output
         new_output = strip_ansi(session.output_buffer[-limit:]) if session.output_buffer else ""
         if new_output:
             from agent.redact import redact_terminal_output
@@ -1685,7 +1685,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         from gateway.run import _redact_gateway_user_facing_secrets
         from agent.redact import redact_terminal_output
         from tools.ansi_strip import strip_ansi
-        from tools.process_registry import transform_process_output
+        from tools.process_registry_output_transform import transform_process_output
         _command = getattr(session, "command", "") or ""
         _raw = strip_ansi(session.output_buffer) if session.output_buffer else ""
         _raw = transform_process_output(_raw, command=_command, returncode=session.exit_code,
@@ -1715,6 +1715,10 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             "exit_code": session.exit_code,
             "completion_reason": getattr(session, "completion_reason", "exited"),
             "termination_source": getattr(session, "termination_source", ""),
+            # The evidence behind the token, and what the dying worker left uncommitted: the
+            # gateway's notice is the only place a human sees either.
+            "termination_detail": getattr(session, "termination_detail", ""),
+            "dirty_worktree": getattr(session, "dirty_worktree", {}) or {},
             "output": _redact_gateway_user_facing_secrets(_out),
             # Spawning session-db id: lets pre-flight drop this completion if the user /new'd first.
             "parent_session_id": (

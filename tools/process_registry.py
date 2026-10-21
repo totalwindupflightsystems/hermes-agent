@@ -37,6 +37,8 @@ from tools.process_registry_notifications import (
 from tools.process_registry_checkpoint import ProcessCheckpointMixin
 from tools.process_registry_output_log import ProcessOutputLogMixin, open_output_log, record_exit_command, worker_output_log
 from tools.process_registry_termination import ProcessTerminationMixin
+from tools.process_registry_attribution import cgroup_path_for_pid, finalize as finalize_termination
+from tools.process_registry_output_transform import _redact_process_result
 from tools.process_registry_results import load_completed_results, save_completed_result
 from tools.process_registry_env_log import log_delta_command
 from tools.process_registry_wsl import _is_wsl_launcher_command
@@ -558,7 +560,13 @@ class ProcessSession:
     exited_at: float = 0.0                      # time.time() of the FIRST move to finished (0 = unknown)
     exit_code: Optional[int] = None             # None while running
     completion_reason: str = "exited"           # exited|killed|lost|failed_start|already_exited
-    termination_source: str = ""                # process.kill|kill_all|backend_lost|failed_start
+    termination_source: str = ""                # process.kill|kill_all|backend_lost|failed_start|
+                                                # cgroup_oom|systemd|unknown_no_supervisor_stop
+    termination_detail: str = ""                # evidence sentence behind termination_source
+    termination_accounting: dict = field(default_factory=dict)   # caps in force at kill time
+    dirty_worktree: dict = field(default_factory=dict)           # salvage evidence for an abnormal death
+    kill_requested_source: str = ""             # OUR stop intent, recorded BEFORE any signal is sent
+    cgroup_path: str = ""                       # worker cgroup-v2 dir captured at spawn (OOM evidence)
     output_buffer: str = ""                     # Rolling tail (last max_output_chars)
     max_output_chars: int = MAX_OUTPUT_CHARS
     detached: bool = False                      # Recovered from checkpoint (no pipe)
@@ -600,6 +608,8 @@ class ProcessSession:
     # Set by the _move_to_finished call that moved the session out of _running; only that call
     # publishes the completion, so a duplicate finisher must not release waiters early.
     _finish_claimed: bool = field(default=False, repr=False)
+    # One-shot guard for termination finalisation (attribution + salvage evidence).
+    _finalized: bool = field(default=False, repr=False)
     # The last stop of ``systemd_unit`` failed, so its descendants may still be alive; bulk
     # cleanup retries the stop even after the session finished.
     _scope_stop_pending: bool = field(default=False, repr=False)
@@ -656,7 +666,7 @@ _CHECKPOINT_FIELDS = (
     "started_at", "task_id", "owner_task_id", "session_key",
     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
     "parent_session_id", "notify_on_complete", "completion_output_chars", "watch_patterns",
-    "heartbeat_seconds", "persist_on_release", "output_log")
+    "heartbeat_seconds", "persist_on_release", "output_log", "cgroup_path")
 _CHECKPOINT_DEFAULTS = {
     f.name: ([] if f.name == "watch_patterns" else f.default)
     for f in ProcessSession.__dataclass_fields__.values()
@@ -1168,6 +1178,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         pty_proc = _PtyProcessCls.spawn(pty_argv, cwd=session.cwd, env=pty_env, dimensions=(30, 120))
         session.pid = pty_proc.pid
         session.host_start_time = self._safe_host_start_time(session.pid)
+        session.cgroup_path = cgroup_path_for_pid(session.pid)
         session._pty = pty_proc
         self._track_started(session, self._pty_reader_loop, f"proc-pty-reader-{session.id}")
         return session
@@ -1232,6 +1243,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         session.process, session.output_log = proc, str(log or "")
         session.pid = proc.pid
         session.host_start_time = self._safe_host_start_time(session.pid)
+        # The worker's cgroup is the ONLY surface a cgroup OOM leaves evidence on, and a
+        # transient scope is collected with its last process — so the path is captured now.
+        session.cgroup_path = cgroup_path_for_pid(session.pid)
         try:
             self._track_started(session, self._log_reader_loop if log else self._reader_loop, f"proc-reader-{session.id}")
         except Exception:
@@ -1565,6 +1579,10 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         Idempotent: kill_process() and the reader thread can both call this; only
         the FIRST move enqueues the completion notification, so no duplicates.
         Returns True when this call is the one that persisted the session."""
+        # Attribution, accounting and salvage evidence are filled once, here, so every way a
+        # process can end is covered by one implementation — and before the lock, because the
+        # salvage probe runs `git status` in the worker's cwd.
+        finalize_termination(session)
         with self._lock:
             was_running = session.id in self._running
             if was_running:
@@ -1621,6 +1639,10 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             "exit_code": session.exit_code,
             "completion_reason": session.completion_reason,
             "termination_source": session.termination_source,
+            # The evidence behind the token and the salvage list, so a consumer never has to
+            # re-derive either (a killed worker's worktree state is only knowable at exit).
+            "termination_detail": session.termination_detail,
+            "dirty_worktree": session.dirty_worktree,
         }
 
     def _release_finished_handles(self, session: ProcessSession):
@@ -2166,6 +2188,11 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                 self._completion_consumed.add(session_id)
             return result
         try:
+            # Record OUR intent before any signal leaves this process. The reader thread can
+            # observe the resulting exit mid-signal and finalise the session first; without
+            # this the post-mortem surfaces (a scope teardown, a unit Result=signal) would be
+            # read as somebody else's kill — a false attribution of our own stop.
+            session.kill_requested_source = source
             early = self._signal_kill(session, session_id, consume_output)
             if early is not None:
                 return early
@@ -2630,43 +2657,6 @@ PROCESS_SCHEMA = {
         "required": ["action"]
     }
 }
-
-
-def transform_process_output(output: str, *, command: str, returncode: Optional[int], task_id: str = "") -> str:
-    """``transform_terminal_output`` seam for background-process output — the poll/wait/log/kill
-    results and the completion/heartbeat/watch notifications — so a plugin that rewrites terminal
-    output sees the same command output whether it ran in the foreground or not (#70760).
-    Same helper as the foreground path; callers redact AFTER it, never before, so a replacement
-    the plugin returns is still masked. ``returncode`` is None while the process is running and
-    ``env_type`` is not recorded per process, so it is passed empty."""
-    from tools.terminal_tool_result import _apply_output_transform_hook
-    return _apply_output_transform_hook(command, output, returncode, task_id or "", "")
-
-
-def _redact_process_result(result: dict) -> dict:
-    """Transform, then redact secrets from background-process output before it reaches the
-    model, session.db and CLI, mirroring the foreground ``terminal`` pipeline (hook first,
-    redaction after) so the two surfaces can't diverge. Respects ``security.redact_secrets``;
-    ``redact_terminal_output`` picks ``code_file`` from the recorded command.
-
-    The command string itself is also redacted in case it carried an inline credential. See #43025.
-    """
-    if not isinstance(result, dict):
-        return result
-    from agent.redact import redact_sensitive_text, redact_terminal_output
-
-    command = result.get("command") or ""
-    # The hook's task_id is the process OWNER's (poll/log/wait results carry only session_id).
-    task_id = str(result.get("task_id") or "")
-    if not task_id and (session := process_registry.get(str(result.get("session_id") or ""))) is not None:
-        task_id = str(getattr(session, "task_id", "") or "")
-    for key in ("output", "output_preview"):
-        if isinstance(value := result.get(key), str) and value:
-            value = transform_process_output(value, command=command, returncode=result.get("exit_code"), task_id=task_id)
-            result[key] = redact_terminal_output(value, command)
-    if isinstance(command, str) and command:
-        result["command"] = redact_sensitive_text(command, code_file=True)
-    return result
 
 
 def _list_processes(task_id) -> dict:

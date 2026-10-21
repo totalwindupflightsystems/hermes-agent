@@ -7,6 +7,8 @@ import time
 from dataclasses import dataclass
 from contextlib import suppress
 
+from tools.process_registry_attribution import dirty_worktree_line, reported_signal
+
 _DONE = ("completed", "success")
 _REASON_STATUS = {"lost": "marked lost because the process backend disappeared", "failed_start": "failed to start"}
 
@@ -453,11 +455,40 @@ def _delegation_attribution_line(evt: dict) -> str | None:
             + (f' Task: "{goal}"' if goal else ""))
 
 
+#: How a termination_source reads in a sentence. The registry token is the receipt field;
+#: a model reading the notice needs the sentence, and "terminated by
+#: unknown_no_supervisor_stop" reads like a bug rather than a measurement.
+_SOURCE_PHRASES = {
+    "unknown_no_supervisor_stop": "an unrecorded stop (no supervisor recorded who sent the signal)",
+    "cgroup_oom": "the worker cgroup's OOM killer",
+    "systemd": "systemd (its unit reported a signal exit)",
+    "backend_lost": "the process backend disappearing",
+    "failed_start": "a launch that never produced a process",
+}
+
+
 def _completion_status(evt: dict) -> str:
     reason = evt.get("completion_reason") or "exited"
     if reason == "killed":
-        return f"terminated by {evt.get('termination_source') or 'Hermes'}"
+        source = str(evt.get("termination_source") or "")
+        return f"terminated by {_SOURCE_PHRASES.get(source, source or 'Hermes')}"
     return _REASON_STATUS.get(reason) or ("completed normally" if evt.get("exit_code", "?") == 0 else "exited")
+
+
+def _termination_evidence(evt: dict) -> str:
+    """The detail sentence and the salvage list as notice lines; "" when there is neither.
+
+    A killed worker's receipt is the only place its worktree state was ever recorded, so a
+    notice that omits it makes salvage depend on the reader thinking to look.
+    """
+    lines = []
+    detail = str(evt.get("termination_detail") or "").strip()
+    if detail:
+        lines.append(f"Why: {detail}")
+    salvage = dirty_worktree_line(evt.get("dirty_worktree") or {})
+    if salvage:
+        lines.append(salvage)
+    return "\n".join(lines) + "\n" if lines else ""
 
 
 def format_process_notification(evt: dict) -> str | None:
@@ -489,7 +520,9 @@ def format_process_notification(evt: dict) -> str | None:
             + (f"\n({_sup} earlier matches were suppressed by rate limit)" if _sup else "") + "]")
     _exit = evt.get("exit_code", "?")
     _out = evt.get("output", "")
-    _signal = ", SIGTERM" if _exit in {-15, 143, "-15", "143"} else ""
+    # Any signal, not just SIGTERM: a -9 read as "exit code -9" hid every other signal too.
+    _signal_name = reported_signal(_exit)
+    _signal = f", {_signal_name}" if _signal_name else ""
     # A subagent-owned process's full output belongs in the child's transcript, not as
     # a raw wall in the parent — trim hard but keep enough tail to recognise failures.
     if _attribution and isinstance(_out, str) and len(_out) > 600:
@@ -503,4 +536,5 @@ def format_process_notification(evt: dict) -> str | None:
                 f"session_id=\"{_sid}\") has the full output)\n{_out}")
     return (
         f"[IMPORTANT: Background process {_sid} {_completion_status(evt)} (exit code {_exit}{_signal}).\n"
+        f"{_termination_evidence(evt)}"
         f"{attribution}Command: {_cmd}\nOutput:\n{_out}]")

@@ -1422,8 +1422,8 @@ class TestKillProcess:
             assert result["status"] == "killed"
             assert result["completion_reason"] == "killed"
             assert result["termination_source"] == "process.kill"
-            # First save: the reader won the race and persisted a plain exit.
-            assert saved[0] == ("exited", "", 0)
+            # First save: the reader wins the race; the source is already our own kill intent.
+            assert saved[0] == ("exited", "process.kill", 0)
             # Second save: the receipt rewritten with the kill outcome.
             assert saved[-1] == ("killed", "process.kill", -15)
         finally:

@@ -22,7 +22,8 @@ MAX_RETAINED_RESULTS = 64
 _RESULT_FIELDS = (
     "id", "command", "cwd", "task_id", "owner_task_id", "session_key",
     "parent_session_id", "started_at", "exit_code", "completion_reason",
-    "termination_source", "notify_on_complete",
+    "termination_source", "termination_detail", "termination_accounting", "dirty_worktree",
+    "notify_on_complete",
 )
 
 
@@ -84,6 +85,28 @@ def _owns_result(owner: str, parent: str | None) -> bool:
         db.close()
 
 
+def _result_field_defaults() -> dict:
+    """Dataclass defaults for the receipt fields, so a receipt written by an older build
+    (before termination_detail / accounting / dirty_worktree existed) still loads instead of
+    being skipped as unreadable — a receipt that silently disappears is worse than a sparse
+    one."""
+    from dataclasses import MISSING
+
+    from tools.process_registry import ProcessSession
+
+    fields = ProcessSession.__dataclass_fields__
+    defaults = {}
+    for key in _RESULT_FIELDS:
+        spec = fields.get(key)
+        if spec is None:
+            continue
+        if spec.default is not MISSING:
+            defaults[key] = spec.default
+        elif spec.default_factory is not MISSING:
+            defaults[key] = spec.default_factory()
+    return defaults
+
+
 def load_completed_results(prefix: str = "") -> dict:
     """Restore read-only snapshots; no process handles, watchers, or queue events."""
     from tools.process_registry import ProcessSession
@@ -93,6 +116,7 @@ def load_completed_results(prefix: str = "") -> dict:
     owner = get_session_env("HERMES_SESSION_ID", "")
     if not owner:
         return {}
+    defaults = _result_field_defaults()
     results = {}
     try:
         paths = _result_paths()
@@ -109,7 +133,7 @@ def load_completed_results(prefix: str = "") -> dict:
             if not _owns_result(owner, record.get("parent_session_id")):
                 continue
             session = ProcessSession(
-                **{key: record[key] for key in _RESULT_FIELDS},
+                **{key: record.get(key, defaults.get(key)) for key in _RESULT_FIELDS},
                 exited=True, output_buffer=record["output"],
             )
             session._completion_event.set()
