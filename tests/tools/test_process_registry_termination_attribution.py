@@ -208,3 +208,38 @@ def test_worktree_report_is_empty_for_a_non_repository(tmp_path):
     assert worktree_report(str(tmp_path)) == {}
     assert worktree_report("") == {}
     assert worktree_report("/does/not/exist") == {}
+
+
+def test_the_retained_receipt_carries_the_attribution(tmp_path):
+    """The incident's artefact was ``logs/process-results/<id>.json`` — the receipt a
+    post-mortem reads. If the fields stop reaching that file, the same empty string returns."""
+    import json
+
+    from hermes_constants import get_hermes_home
+
+    registry = ProcessRegistry()
+    repo = _dirty_repo(tmp_path)
+    session = _spawn_and_kill(registry, repo)
+
+    path = get_hermes_home() / "logs" / "process-results" / f"{session.id}.json"
+    receipt = json.loads(path.read_text(encoding="utf-8-sig"))
+    assert receipt["exit_code"] == -signal.SIGKILL
+    assert receipt["completion_reason"] == "killed"
+    assert receipt["termination_source"] == UNKNOWN_STOP
+    assert "SIGKILL" in receipt["termination_detail"]
+    assert receipt["termination_accounting"]["caps"]["wall_clock"]["applies"] is False
+    assert receipt["dirty_worktree"] == {
+        "dirty": True, "staged": 1, "unstaged": 1, "untracked": 1, "changed": 3,
+        "sample": ["staged.txt", "tracked.txt", "untracked.txt"], "truncated": False,
+    }
+
+
+def test_every_receipt_field_has_a_default_so_older_receipts_still_load():
+    """A receipt written before a field existed must load with its default instead of being
+    skipped as unreadable: a receipt that silently disappears is worse than a sparse one."""
+    from tools.process_registry_results import _RESULT_FIELDS, _result_field_defaults
+
+    defaults = _result_field_defaults()
+    # `id`/`command` are required (no default) and every producer has always written them.
+    optional = set(_RESULT_FIELDS) - {"id", "command"}
+    assert optional <= set(defaults), optional - set(defaults)
